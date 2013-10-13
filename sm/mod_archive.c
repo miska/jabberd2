@@ -50,6 +50,13 @@ typedef enum {
     OUT_D = 2,
 } direction;
 
+typedef enum {
+    A_NEVER  = 0,
+    A_ALWAYS = 1,
+    A_ROSTER = 2,
+} archiving;
+
+
 /**
  * Creates unique ID for every message.
  */
@@ -121,10 +128,12 @@ mod_ret_t savepkt(pkt_t pkt, int direct) {
     char *mem=NULL;
     const *owner = NULL, *other = NULL;
     int sz = 0;
+    int archive=0;
+    char filter[2060]; // 2048 is jid_user maximum length
     time_t t=0;
     jid_t own_jid, other_jid;
-    os_t os;
-    os_object_t o;
+    os_t os, set_os=NULL;
+    os_object_t o, set_o=NULL;
 
     // Is it a message?
     log_debug(ZONE, "Testing message...");
@@ -147,9 +156,6 @@ mod_ret_t savepkt(pkt_t pkt, int direct) {
         return mod_PASS;
 
     log_debug(ZONE, "It's meaningful message!", pkt->from);
-    // Prepare to store them
-    os = os_new();
-    o = os_object_new(os);
 
     // What direction are we talking about?
     if (direct == IN_D) {
@@ -159,9 +165,6 @@ mod_ret_t savepkt(pkt_t pkt, int direct) {
         own_jid   = pkt->from;
         other_jid = pkt->to;
     }
-
-    // Real storing
-    log_debug(ZONE, "Saving...");
 
     // Get JIDs
     if(own_jid != NULL) {
@@ -175,8 +178,65 @@ mod_ret_t savepkt(pkt_t pkt, int direct) {
         return mod_PASS;
     }
 
-    log_debug(ZONE, "Saving message for %s (other party is %s)", owner, other);
+    // Check settings
 
+    // Load defaults
+    snprintf(filter, 2060, "(jid=%s)", owner);
+    if((storage_get(pkt->sm->st, tbl_name "_settings", owner, filter, &set_os) == st_SUCCESS) &&
+        (os_iter_first(set_os)) && ((set_o=os_iter_object(set_os))!=NULL))
+        os_object_get_int(set_os, set_o, "setting", &archive);
+
+    // Cleanup
+    if(set_o != NULL) {
+        os_object_free(set_o);
+        set_o=NULL;
+    }
+    if(set_os != NULL) {
+        os_free(set_os);
+        set_os=NULL;
+    }
+
+    // Load contact specific
+    snprintf(filter, 2060, "(jid=%s)", other);
+    if((storage_get(pkt->sm->st, tbl_name "_settings", owner, filter, &set_os) == st_SUCCESS) &&
+        (os_iter_first(set_os)) && ((set_o=os_iter_object(set_os))!=NULL))
+        os_object_get_int(set_os, set_o, "setting", &archive);
+
+    // Cleanup
+    if(set_o != NULL) {
+        os_object_free(set_o);
+        set_o=NULL;
+    }
+    if(set_os != NULL) {
+        os_free(set_os);
+        set_os=NULL;
+    }
+
+    // Do we need to check roster?
+    if(archive==A_ROSTER) {
+        snprintf(filter, 2060, "(jid=%s)", other);
+        if(storage_get(pkt->sm->st, "roster-items", owner, filter, &set_os) == st_SUCCESS)
+            archive=A_ALWAYS;
+        else
+            archive=A_NEVER;
+        if(set_os != NULL) {
+            os_free(set_os);
+            set_os=NULL;
+        }
+    }
+
+    // Decide
+    if(archive==A_NEVER)
+        return mod_PASS;
+
+    // Prepare to store them
+    os = os_new();
+    if(os == NULL) return mod_PASS;
+    o = os_object_new(os);
+    if(o  == NULL) return mod_PASS;
+
+    // Real storing
+    log_debug(ZONE, "Saving message for %s (other party is %s)", owner, other);
 
     // Message
 
