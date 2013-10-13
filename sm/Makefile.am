@@ -6,6 +6,7 @@ bin_PROGRAMS = sm
 pkglib_LTLIBRARIES = mod_active.la \
                   mod_announce.la \
                   mod_amp.la \
+                  mod_archive.la \
                   mod_deliver.la \
                   mod_disco.la \
                   mod_echo.la \
@@ -67,6 +68,12 @@ mod_amp_la_SOURCES = mod_amp.c
 mod_amp_la_LDFLAGS = -module -export-dynamic
 if USE_LIBSUBST
 mod_amp_la_LIBADD = $(top_builddir)/subst/libsubst.la
+endif
+
+mod_archive_la_SOURCES = mod_archive.c
+mod_archive_la_LDFLAGS = -module -export-dynamic
+if USE_LIBSUBST
+mod_save_la_LIBADD = $(top_builddir)/subst/libsubst.la
 endif
 
 mod_deliver_la_SOURCES = mod_deliver.c
