@@ -28,20 +28,21 @@
 #include <time.h>
 
 #define max(a,b) (((a)>(b))?(a):(b))
+#define min(a,b) (((a)<(b))?(a):(b))
 
 //! Name of the table where messages are stored
 #define tbl_name "archive"
 //! How long is the random part of message ID
 #define mid_rand_len 4
+//! URI of the message
+#define archive_uri "urn:xmpp:mam:tmp"
 
 /** @file sm/mod_archive.c
   * @brief Message archiving module
   * @author Michal Hrusecky
-  * $Date: 2006/09/06 01:06:48 $
-  * $Revision: 1.4 $
   *
   * Ultimate goal of this module is implementation of XEP-0313, so far only
-  * archiving is supported, no queries and no preferences.
+  * archiving and setting preferences is supported, no queries yet.
   *
   */
 
@@ -56,6 +57,10 @@ typedef enum {
     A_ROSTER = 2,
 } archiving;
 
+//! Default mode
+#define default_mode A_NEVER
+
+static int ns_ARCHIVE = 0;
 
 /**
  * Creates unique ID for every message.
@@ -128,7 +133,7 @@ mod_ret_t savepkt(pkt_t pkt, int direct) {
     char *mem=NULL;
     const *owner = NULL, *other = NULL;
     int sz = 0;
-    int archive=0;
+    int archive=default_mode;
     char filter[2060]; // 2048 is jid_user maximum length
     time_t t=0;
     jid_t own_jid, other_jid;
@@ -321,6 +326,214 @@ static mod_ret_t save_rt_out(mod_instance_t mi, pkt_t pkt) {
     return savepkt(pkt,OUT_D);
 }
 
+/** Send archiving preferences */
+void send_arch_prefs(mod_instance_t mi, sess_t sess, pkt_t pkt) {
+    module_t mod = mi->mod;
+    int prefs;
+    int archive=default_mode;
+    int section;
+    int check;
+    char buff[2060]; // 2048 is jid_user maximum length
+    char* ret_str=buff;
+    os_t os = NULL;
+    os_object_t o = NULL;
+    pkt_t reply;
+
+    // Create a new packet
+    log_debug(ZONE, "Construction of reply with current settings");
+    reply = pkt_create(sess->user->sm, "iq", "result", NULL, NULL);
+
+    // Defaults
+    log_debug(ZONE, "Getting defaults");
+    prefs = nad_append_elem(reply->nad, nad_add_namespace(reply->nad, archive_uri, NULL), "prefs", 2);
+
+    // Load defaults
+    snprintf(buff, 2060, "(jid=%s)", jid_user(sess->jid));
+    if((storage_get(sess->user->sm->st, tbl_name "_settings", jid_user(sess->jid), buff, &os) == st_SUCCESS) &&
+        (os_iter_first(os)) && ((o=os_iter_object(os))!=NULL))
+            os_object_get_int(os, o, "setting", &archive);
+
+    // Set defaults
+    switch(archive) {
+        case A_ALWAYS:
+            nad_set_attr(reply->nad, prefs, -1,"default", "always", 6);
+            break;
+        case A_ROSTER:
+            nad_set_attr(reply->nad, prefs, -1,"default", "roster", 6);
+            break;
+        default:
+            nad_set_attr(reply->nad, prefs, -1,"default", "never", 5);
+            break;
+    }
+
+
+    // Cleanup
+    if(o != NULL) {
+        os_object_free(o);
+        o=NULL;
+    }
+    if(os != NULL) {
+        os_free(os);
+        os=NULL;
+    }
+
+    // Always archiving
+    log_debug(ZONE, "Getting what to archive always");
+    section = nad_append_elem(reply->nad, -1, "always", 3);
+    if(storage_get(sess->user->sm->st, tbl_name "_settings", jid_user(sess->jid), "(setting=1)", &os) == st_SUCCESS)
+    if(os_iter_first(os))
+        do {
+            o = os_iter_object(os);
+            if((o != NULL) && (os_object_get_str(os, o, "jid", &ret_str)) && (ret_str != NULL)) {
+                nad_append_elem(reply->nad, -1, "jid", 4);
+                nad_append_cdata(reply->nad, ret_str, strlen(ret_str), 5);
+            }
+        } while(os_iter_next(os));
+
+    // Cleanup
+    if(o != NULL) {
+        os_object_free(o);
+        o=NULL;
+    }
+    if(os != NULL) {
+        os_free(os);
+        os=NULL;
+    }
+
+    // Never archiving
+    log_debug(ZONE, "Getting what to never archive");
+    section = nad_append_elem(reply->nad, -1, "never", 3);
+    if(storage_get(sess->user->sm->st, tbl_name "_settings", jid_user(sess->jid), "(setting=0)", &os) == st_SUCCESS)
+    if(os_iter_first(os))
+        do {
+            o = os_iter_object(os);
+            if((o != NULL) && (os_object_get_str(os, o, "jid", &ret_str)) && (ret_str != NULL)) {
+                nad_append_elem(reply->nad, -1, "jid", 4);
+                nad_append_cdata(reply->nad, ret_str, strlen(ret_str), 5);
+            }
+        } while(os_iter_next(os));
+
+    // Cleanup
+    if(o != NULL) {
+        os_object_free(o);
+        o=NULL;
+    }
+    if(os != NULL) {
+        os_free(os);
+        os=NULL;
+    }
+
+    // Send packet
+    pkt_id(pkt, reply);
+    pkt_sess(reply, sess);
+    pkt_free(pkt);
+}
+
+/** Handles iq messages */
+mod_ret_t archive_iq_in_sess(mod_instance_t mi, sess_t sess, pkt_t pkt) {
+    int prefs, type;
+    int section, ptr;
+    os_t os;
+    os_object_t o;
+    char* owner;
+    char buff[2048];
+    log_debug(ZONE, "In session");
+
+    // we only want to play IQs
+    if((!((pkt->type & pkt_IQ) || (pkt->type & pkt_IQ_SET))) || (pkt->ns != ns_ARCHIVE))
+        return mod_PASS;
+    log_debug(ZONE, "Passed through packet checks");
+
+    // if it has a to, throw it out
+    if(pkt->to != NULL)
+        return -stanza_err_BAD_REQUEST;
+
+    // Who are we?
+    owner=jid_user(sess->jid);
+
+    // Check for no type or get to send current settings
+    if((type = (nad_find_attr(pkt->nad, 2, -1, "type", NULL)<0)) ||
+       ((NAD_AVAL_L(pkt->nad, type ) == 3) && strncmp("get", NAD_AVAL(pkt->nad, type), 3))) {
+        log_debug(ZONE, "Somebody is asking about settings");
+        send_arch_prefs(mi, sess, pkt);
+        return mod_HANDLED;
+    }
+
+    // We are setting stuff
+    if(pkt->type == pkt_IQ_SET) {
+        // Prepare to store them
+        log_debug(ZONE, "Setting archiving preferences...");
+        os = os_new();
+        if(os == NULL) return mod_PASS;
+        o = os_object_new(os);
+        if(o  == NULL) return mod_PASS;
+
+        // Get rid of old settings
+        storage_delete(pkt->sm->st, tbl_name "_settings", owner, NULL);
+        log_debug(ZONE, "Got rid of old preferences...");
+
+        // Find if there is an default option
+        if(!((prefs=nad_find_elem(pkt->nad, 1, -1, "prefs", 1))>0))
+            return mod_PASS;
+        ptr=nad_find_attr(pkt->nad, prefs, -1, "default", NULL);
+
+        if(ptr>0) {
+            // Defaults
+            log_debug(ZONE, "Saving defaults...");
+            os_object_put(o, "jid", owner, os_type_STRING);
+            if     (strncmp("roster",NAD_AVAL(pkt->nad, ptr), NAD_AVAL_L(pkt->nad, ptr))==0)
+                prefs=A_ROSTER;
+            else if(strncmp("always",NAD_AVAL(pkt->nad, ptr), NAD_AVAL_L(pkt->nad, ptr))==0)
+                prefs=A_ALWAYS;
+            else
+                prefs=A_NEVER;
+            os_object_put(o, "setting", &prefs,  os_type_INTEGER);
+            log_debug(ZONE, "Setting default to %d...", prefs);
+
+            // What to save always
+            log_debug(ZONE, "Saving what to save always...");
+            if(((section = nad_find_elem(pkt->nad, prefs, -1, "always", 1))>0)) {
+                log_debug(ZONE, "Found always section %d...", section);
+                prefs=A_ALWAYS;
+                for(ptr = nad_find_elem(pkt->nad, section, -1, "jid", 1); ptr > 0;
+                    ptr = nad_find_elem(pkt->nad, ptr,     -1, "jid", 0)) {
+                        o = os_object_new(os);
+                        strncpy(buff, NAD_CDATA(pkt->nad, ptr), min(2047,NAD_CDATA_L(pkt->nad, ptr)));
+                        buff[min(2047,NAD_CDATA_L(pkt->nad, ptr))]=0;
+                        os_object_put(o, "jid",      buff,  os_type_STRING);
+                        os_object_put(o, "setting", &prefs, os_type_INTEGER);
+                        log_debug(ZONE, "Always archiving %s...", buff);
+                }
+            }
+
+            // What to never save
+            log_debug(ZONE, "Saving what never save...");
+            if(((section = nad_find_elem(pkt->nad, 2, -1, "never",  1))>0)) {
+                log_debug(ZONE, "Found never section %d...", section);
+                prefs=A_NEVER;
+                for(ptr = nad_find_elem(pkt->nad, section, -1, "jid", 1); ptr > 0;
+                    ptr = nad_find_elem(pkt->nad, ptr,     -1, "jid", 0)) {
+                        o = os_object_new(os);
+                        strncpy(buff, NAD_CDATA(pkt->nad, ptr), min(2047,NAD_CDATA_L(pkt->nad, ptr)));
+                        buff[min(2047,NAD_CDATA_L(pkt->nad, ptr))]=0;
+                        os_object_put(o, "jid",      buff,  os_type_STRING);
+                        os_object_put(o, "setting", &prefs, os_type_INTEGER);
+                        log_debug(ZONE, "Never archiving %s...", buff);
+                }
+            }
+
+            // Save everything
+            storage_put(pkt->sm->st, tbl_name "_settings", owner, os);
+        }
+
+        // Send current settings
+        send_arch_prefs(mi, sess, pkt);
+        return mod_HANDLED;
+    }
+    return mod_PASS;
+}
+
+
 // Module initialization
 DLLEXPORT int module_init(mod_instance_t mi, char *arg) {
     log_debug(ZONE, "Archiving plugin init");
@@ -330,9 +543,11 @@ DLLEXPORT int module_init(mod_instance_t mi, char *arg) {
     if(mod->init) return 0;
 
     mod->in_router = save_rt_in;
+    mod->in_sess = archive_iq_in_sess;
     mod->out_router = save_rt_out;
 
-    feature_register(mod->mm->sm, "urn:xmpp:mam:tmp");
+    feature_register(mod->mm->sm, archive_uri);
+    ns_ARCHIVE = sm_register_ns(mod->mm->sm, archive_uri);
 
     return 0;
 }
